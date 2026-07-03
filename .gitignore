@@ -1,2 +1,6 @@
 target/
 test_snapshots/
+.stellar/
+.soroban/
+*.wasm
+!fixtures/**/*.wasm
