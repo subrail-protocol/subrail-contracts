@@ -2,8 +2,14 @@
 resolver = "2"
 members = ["contracts/*"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/subrail-protocol/subrail-contracts"
+
 [workspace.dependencies]
-soroban-sdk = "23"
+soroban-sdk = "23.1.0"
 
 [profile.release]
 opt-level = "z"
