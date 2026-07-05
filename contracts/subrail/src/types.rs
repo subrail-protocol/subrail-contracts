@@ -2,7 +2,7 @@ use soroban_sdk::{contracttype, Address, String};
 
 /// Lifecycle of a subscription.
 ///
-///  ⁠text
+///  text
 ///                          +---------+
 ///        subscribe ------> | Active  | <---- resume / successful charge
 ///                          +---------+
@@ -17,7 +17,7 @@ use soroban_sdk::{contracttype, Address, String};
 ///
 ///        cancel (from Active / PastDue / Paused) ------> Cancelled
 ///
-⁠ #[contracttype]
+#[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SubscriptionStatus {
     /// Billing normally.
