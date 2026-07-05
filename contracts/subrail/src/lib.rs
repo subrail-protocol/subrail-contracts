@@ -1,8 +1,8 @@
 #![no_std]
 
 pub mod errors;
-pub mod types;
 pub mod events;
+pub mod types;
 
 use soroban_sdk::{contract, contractimpl, vec, Env, String, Vec};
 
