@@ -1,9 +1,21 @@
 //! # SubRail — recurring payments protocol for Soroban
 //!
-//! Contract core. Domain modules: [`types`], [`errors`], [`events`],
-//! [`storage`]. Merchant, subscriber, and keeper entry points land in
-//! later milestones; this registers the contract with its admin
-//! bootstrap and version query.
+//! SubRail lets merchants define billing plans and subscribers authorize
+//! capped, non-custodial recurring pull-payments against them.
+//!
+//! ## Model
+//!
+//! - A **Plan** is immutable after creation (except its `active` flag), so
+//!   what a subscriber agreed to can never silently change.
+//! - A **Subscription** carries a subscriber-set per-period cap
+//!   (`max_amount`) and an optional lifetime `spend_ceiling`.
+//! - The subscriber prepays into a per-subscription **balance** held by
+//!   this contract, withdrawable at any time. `charge` can move at most
+//!   one period's price per elapsed interval from that balance to the
+//!   merchant — never more, never early.
+//! - `charge` is permissionless so any keeper can settle due periods.
+//!   Payment failure does not revert: it transitions the subscription to
+//!   `PastDue`, and to `Expired` once the plan's grace window elapses.
 #![no_std]
 
 pub mod errors;
@@ -221,6 +233,34 @@ impl SubRailContract {
         Ok(())
     }
 
+    // ── Keeper action ───────────────────────────────────────────────────────
+
+    /// Attempt to settle the current due period. Permissionless — any
+    /// keeper may call it — because every safety property (cap, ceiling,
+    /// schedule) is enforced here, not by trusting the caller.
+    ///
+    /// Payment failure does not error: it returns an outcome and persists
+    /// the resulting state transition.
+    pub fn charge(env: Env, sub_id: u64) -> Result<ChargeOutcome, Error> {
+        let mut sub = storage::get_subscription(&env, sub_id)?;
+        if !matches!(
+            sub.status,
+            SubscriptionStatus::Active | SubscriptionStatus::PastDue
+        ) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < sub.next_charge_at {
+            return Err(Error::ChargeNotDue);
+        }
+
+        let plan = storage::get_plan(&env, sub.plan_id)?;
+        let outcome = Self::settle_period(&env, &plan, &mut sub, now);
+        storage::set_subscription(&env, &sub);
+        Ok(outcome)
+    }
+
     // ── Read-only queries ───────────────────────────────────────────────────
 
     pub fn get_plan(env: Env, plan_id: u64) -> Result<Plan, Error> {
@@ -242,6 +282,15 @@ impl SubRailContract {
     /// Prepaid balance currently held for a subscription.
     pub fn get_balance(env: Env, sub_id: u64) -> Result<i128, Error> {
         Ok(storage::get_subscription(&env, sub_id)?.balance)
+    }
+
+    /// Whether a charge is currently permitted for this subscription.
+    pub fn is_charge_due(env: Env, sub_id: u64) -> Result<bool, Error> {
+        let sub = storage::get_subscription(&env, sub_id)?;
+        Ok(matches!(
+            sub.status,
+            SubscriptionStatus::Active | SubscriptionStatus::PastDue
+        ) && env.ledger().timestamp() >= sub.next_charge_at)
     }
 
     pub fn get_admin(env: Env) -> Result<Address, Error> {
