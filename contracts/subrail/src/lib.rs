@@ -14,7 +14,7 @@ pub mod types;
 #[cfg(test)]
 mod test;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
 pub use crate::errors::Error;
 pub use crate::types::{ChargeOutcome, Plan, Subscription, SubscriptionStatus};
@@ -98,14 +98,98 @@ impl SubRailContract {
         Ok(())
     }
 
+    // ── Subscriber actions ──────────────────────────────────────────────────
+
+    /// Subscribe to a plan. Transfers `initial_deposit` from the
+    /// subscriber into the contract, then immediately settles the first
+    /// period. Returns the new subscription id.
+    ///
+    /// - `max_amount` is the subscriber's hard per-period cap and must be
+    ///   at least the plan price.
+    /// - `spend_ceiling` optionally bounds lifetime spend (`0` = none).
+    pub fn subscribe(
+        env: Env,
+        subscriber: Address,
+        plan_id: u64,
+        max_amount: i128,
+        spend_ceiling: i128,
+        initial_deposit: i128,
+    ) -> Result<u64, Error> {
+        subscriber.require_auth();
+
+        let plan = storage::get_plan(&env, plan_id)?;
+        if !plan.active {
+            return Err(Error::PlanInactive);
+        }
+        if max_amount < plan.amount {
+            return Err(Error::CapBelowPlanAmount);
+        }
+        if spend_ceiling < 0 || initial_deposit <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if initial_deposit < plan.amount {
+            return Err(Error::DepositBelowFirstCharge);
+        }
+        if spend_ceiling > 0 && spend_ceiling < plan.amount {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Pull the prepaid balance into the contract.
+        let contract_addr = env.current_contract_address();
+        token::TokenClient::new(&env, &plan.token).transfer(
+            &subscriber,
+            &contract_addr,
+            &initial_deposit,
+        );
+
+        let now = env.ledger().timestamp();
+        let id = storage::next_sub_id(&env);
+        let mut sub = Subscription {
+            id,
+            plan_id,
+            subscriber: subscriber.clone(),
+            status: SubscriptionStatus::Active,
+            max_amount,
+            spend_ceiling,
+            balance: initial_deposit,
+            total_spent: 0,
+            next_charge_at: now,
+            periods_paid: 0,
+            failed_attempts: 0,
+            paused_at: 0,
+            created_at: now,
+        };
+
+        // Settle the first period immediately.
+        Self::settle_period(&env, &plan, &mut sub, now);
+
+        storage::set_subscription(&env, &sub);
+        storage::push_subscriber_sub(&env, &subscriber, id);
+        events::subscribed(&env, id, plan_id, &subscriber, max_amount);
+        Ok(id)
+    }
+
     // ── Read-only queries ───────────────────────────────────────────────────
 
     pub fn get_plan(env: Env, plan_id: u64) -> Result<Plan, Error> {
         storage::get_plan(&env, plan_id)
     }
 
+    pub fn get_subscription(env: Env, sub_id: u64) -> Result<Subscription, Error> {
+        storage::get_subscription(&env, sub_id)
+    }
+
     pub fn get_merchant_plans(env: Env, merchant: Address) -> Vec<u64> {
         storage::get_merchant_plans(&env, &merchant)
+    }
+
+    pub fn get_subscriber_subscriptions(env: Env, subscriber: Address) -> Vec<u64> {
+        storage::get_subscriber_subs(&env, &subscriber)
+    }
+
+    /// Prepaid balance currently held for a subscription.
+    pub fn get_balance(env: Env, sub_id: u64) -> Result<i128, Error> {
+        Ok(storage::get_subscription(&env, sub_id)?.balance)
     }
 
     pub fn get_admin(env: Env) -> Result<Address, Error> {
@@ -115,5 +199,75 @@ impl SubRailContract {
     /// Contract-level version constant.
     pub fn get_version(_env: Env) -> u32 {
         CONTRACT_VERSION
+    }
+
+    // ── Internal ────────────────────────────────────────────────────────────
+
+    /// Core billing step shared by `subscribe` (first period) and
+    /// `charge` (every later period). Mutates `sub` in place and emits
+    /// the matching events; the caller persists.
+    fn settle_period(env: &Env, plan: &Plan, sub: &mut Subscription, now: u64) -> ChargeOutcome {
+        let prev = sub.status;
+
+        // Defensive: a plan is immutable, but re-check the cap so the
+        // invariant "never charge above max_amount" is enforced at the
+        // exact point value moves, not only at subscribe time.
+        debug_assert!(plan.amount <= sub.max_amount);
+
+        // Lifetime ceiling reached → complete as Expired, charge nothing.
+        if sub.spend_ceiling > 0 && sub.total_spent + plan.amount > sub.spend_ceiling {
+            sub.status = SubscriptionStatus::Expired;
+            events::status_changed(env, sub.id, prev, sub.status);
+            return ChargeOutcome::CeilingReached;
+        }
+
+        if sub.balance >= plan.amount {
+            // Happy path: move one period's price to the merchant.
+            sub.balance -= plan.amount;
+            sub.total_spent += plan.amount;
+            sub.periods_paid += 1;
+            sub.failed_attempts = 0;
+            // Recovery from PastDue re-anchors the schedule at `now`
+            // (no retroactive back-billing of missed periods in v1).
+            sub.next_charge_at = if prev == SubscriptionStatus::PastDue {
+                now + plan.interval
+            } else {
+                sub.next_charge_at + plan.interval
+            };
+            sub.status = SubscriptionStatus::Active;
+
+            token::TokenClient::new(env, &plan.token).transfer(
+                &env.current_contract_address(),
+                &plan.merchant,
+                &plan.amount,
+            );
+            events::charged(env, sub.id, plan.amount, sub.periods_paid);
+            if prev != SubscriptionStatus::Active {
+                events::status_changed(env, sub.id, prev, sub.status);
+            }
+            ChargeOutcome::Charged
+        } else if now > sub.next_charge_at.saturating_add(plan.grace_period) {
+            // Underfunded past the grace window → terminal Expired.
+            // Any residual balance is refunded to the subscriber here,
+            // since terminal states hold no funds.
+            let refund = sub.balance;
+            sub.balance = 0;
+            sub.status = SubscriptionStatus::Expired;
+            if refund > 0 {
+                token::TokenClient::new(env, &plan.token).transfer(
+                    &env.current_contract_address(),
+                    &sub.subscriber,
+                    &refund,
+                );
+            }
+            events::status_changed(env, sub.id, prev, sub.status);
+            ChargeOutcome::GraceElapsed
+        } else {
+            // Underfunded but within grace → PastDue, count the attempt.
+            sub.status = SubscriptionStatus::PastDue;
+            sub.failed_attempts += 1;
+            events::charge_failed(env, sub.id, prev, sub.status, sub.failed_attempts);
+            ChargeOutcome::InsufficientFunds
+        }
     }
 }

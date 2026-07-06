@@ -2,11 +2,11 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token::TokenClient,
+    token::{StellarAssetClient, TokenClient},
     Address, Env, String,
 };
 
-use crate::{Error, SubRailContract, SubRailContractClient};
+use crate::{Error, SubRailContract, SubRailContractClient, SubscriptionStatus};
 
 const MONTH: u64 = 30 * 24 * 3_600;
 const WEEK: u64 = 7 * 24 * 3_600;
@@ -17,6 +17,7 @@ struct Setup<'a> {
     client: SubRailContractClient<'a>,
     token: TokenClient<'a>,
     merchant: Address,
+    subscriber: Address,
 }
 
 fn setup() -> Setup<'static> {
@@ -26,10 +27,12 @@ fn setup() -> Setup<'static> {
 
     let admin = Address::generate(&env);
     let merchant = Address::generate(&env);
+    let subscriber = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token = TokenClient::new(&env, &sac.address());
+    StellarAssetClient::new(&env, &sac.address()).mint(&subscriber, &10_000_000_000);
 
     let contract_id = env.register(SubRailContract, ());
     let client = SubRailContractClient::new(&env, &contract_id);
@@ -40,6 +43,7 @@ fn setup() -> Setup<'static> {
         client,
         token,
         merchant,
+        subscriber,
     }
 }
 
@@ -103,13 +107,56 @@ fn create_plan_rejects_bad_inputs() {
 }
 
 #[test]
-fn set_plan_active_toggles() {
+fn set_plan_active_toggles_and_blocks_new_subs() {
     let s = setup();
     let plan_id = create_default_plan(&s);
-
     s.client.set_plan_active(&plan_id, &false);
     assert!(!s.client.get_plan(&plan_id).active);
 
-    s.client.set_plan_active(&plan_id, &true);
-    assert!(s.client.get_plan(&plan_id).active);
+    assert_eq!(
+        s.client
+            .try_subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 3)),
+        Err(Ok(Error::PlanInactive))
+    );
+}
+
+// ── Subscribe ──────────────────────────────────────────────────────────────
+
+#[test]
+fn subscribe_charges_first_period_immediately() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 3));
+
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.periods_paid, 1);
+    assert_eq!(sub.total_spent, PRICE);
+    assert_eq!(sub.balance, PRICE * 2);
+    assert_eq!(s.token.balance(&s.merchant), PRICE);
+    assert_eq!(sub.next_charge_at, 1_700_000_000 + MONTH);
+}
+
+#[test]
+fn subscribe_rejects_cap_below_plan_price() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    assert_eq!(
+        s.client
+            .try_subscribe(&s.subscriber, &plan_id, &(PRICE - 1), &0, &(PRICE * 3)),
+        Err(Ok(Error::CapBelowPlanAmount))
+    );
+}
+
+#[test]
+fn subscribe_rejects_deposit_below_first_charge() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    assert_eq!(
+        s.client
+            .try_subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE - 1)),
+        Err(Ok(Error::DepositBelowFirstCharge))
+    );
 }
