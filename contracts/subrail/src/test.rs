@@ -6,7 +6,7 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
-use crate::{Error, SubRailContract, SubRailContractClient, SubscriptionStatus};
+use crate::{ChargeOutcome, Error, SubRailContract, SubRailContractClient, SubscriptionStatus};
 
 const MONTH: u64 = 30 * 24 * 3_600;
 const WEEK: u64 = 7 * 24 * 3_600;
@@ -56,6 +56,10 @@ fn create_default_plan(s: &Setup) -> u64 {
         &WEEK,
         &String::from_str(&s.env, "Pro Monthly"),
     )
+}
+
+fn advance(env: &Env, secs: u64) {
+    env.ledger().with_mut(|l| l.timestamp += secs);
 }
 
 // ── Setup & plans ──────────────────────────────────────────────────────────
@@ -159,6 +163,113 @@ fn subscribe_rejects_deposit_below_first_charge() {
             .try_subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE - 1)),
         Err(Ok(Error::DepositBelowFirstCharge))
     );
+}
+
+// ── Charge / keeper flow ───────────────────────────────────────────────────
+
+#[test]
+fn charge_settles_when_due() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 3));
+
+    advance(&s.env, MONTH);
+    assert!(s.client.is_charge_due(&sub_id));
+    assert_eq!(s.client.charge(&sub_id), ChargeOutcome::Charged);
+
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.periods_paid, 2);
+    assert_eq!(sub.balance, PRICE);
+    assert_eq!(s.token.balance(&s.merchant), PRICE * 2);
+}
+
+#[test]
+fn charge_too_early_is_rejected() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 3));
+
+    advance(&s.env, MONTH - 10);
+    assert!(!s.client.is_charge_due(&sub_id));
+    assert_eq!(s.client.try_charge(&sub_id), Err(Ok(Error::ChargeNotDue)));
+}
+
+#[test]
+fn underfunded_charge_moves_to_past_due_then_recovers() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    // Deposit only covers the first period.
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &PRICE);
+
+    advance(&s.env, MONTH);
+    assert_eq!(s.client.charge(&sub_id), ChargeOutcome::InsufficientFunds);
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::PastDue);
+    assert_eq!(sub.failed_attempts, 1);
+
+    // Top up within the grace window and retry.
+    s.client.deposit(&sub_id, &(PRICE * 2));
+    let recovered_at = s.env.ledger().timestamp() + 3_600;
+    advance(&s.env, 3_600);
+    assert_eq!(s.client.charge(&sub_id), ChargeOutcome::Charged);
+
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.failed_attempts, 0);
+    assert_eq!(sub.periods_paid, 2);
+    // Recovery re-anchors the schedule at the recovery time.
+    assert_eq!(sub.next_charge_at, recovered_at + MONTH);
+}
+
+#[test]
+fn grace_elapsed_expires_and_refunds_residual() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    // Leave a residual smaller than one period: deposit 1.5x price.
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE + PRICE / 2));
+    let wallet_after_subscribe = s.token.balance(&s.subscriber);
+
+    // Past due date AND past the grace window.
+    advance(&s.env, MONTH + WEEK + 1);
+    assert_eq!(s.client.charge(&sub_id), ChargeOutcome::GraceElapsed);
+
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Expired);
+    assert_eq!(sub.balance, 0);
+    // Residual half-period came back to the subscriber's wallet.
+    assert_eq!(
+        s.token.balance(&s.subscriber),
+        wallet_after_subscribe + PRICE / 2
+    );
+    // Terminal: further charges are invalid.
+    assert_eq!(s.client.try_charge(&sub_id), Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn spend_ceiling_completes_subscription() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    // Ceiling of exactly two periods.
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &(PRICE * 2), &(PRICE * 5));
+
+    advance(&s.env, MONTH);
+    assert_eq!(s.client.charge(&sub_id), ChargeOutcome::Charged);
+
+    advance(&s.env, MONTH);
+    assert_eq!(s.client.charge(&sub_id), ChargeOutcome::CeilingReached);
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Expired);
+    assert_eq!(sub.total_spent, PRICE * 2);
 }
 
 // ── Deposit / withdraw ─────────────────────────────────────────────────────
