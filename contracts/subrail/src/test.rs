@@ -292,3 +292,57 @@ fn withdraw_keeps_subscriber_in_control() {
         Err(Ok(Error::InsufficientBalance))
     );
 }
+
+// ── Pause / resume / cancel ────────────────────────────────────────────────
+
+#[test]
+fn pause_shifts_schedule_by_paused_duration() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 3));
+    let original_due = s.client.get_subscription(&sub_id).next_charge_at;
+
+    advance(&s.env, WEEK);
+    s.client.pause(&sub_id);
+    assert_eq!(
+        s.client.get_subscription(&sub_id).status,
+        SubscriptionStatus::Paused
+    );
+
+    // Charging while paused is invalid even after the original due date.
+    advance(&s.env, MONTH);
+    assert_eq!(s.client.try_charge(&sub_id), Err(Ok(Error::InvalidStatus)));
+
+    s.client.resume(&sub_id);
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    // Schedule shifted by exactly the month spent paused.
+    assert_eq!(sub.next_charge_at, original_due + MONTH);
+}
+
+#[test]
+fn cancel_refunds_full_balance_and_is_terminal() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 3));
+    let wallet_before = s.token.balance(&s.subscriber);
+
+    s.client.cancel(&sub_id);
+
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
+    assert_eq!(sub.balance, 0);
+    assert_eq!(s.token.balance(&s.subscriber), wallet_before + PRICE * 2);
+
+    // Terminal: no deposit, no double cancel, no charge.
+    assert_eq!(
+        s.client.try_deposit(&sub_id, &PRICE),
+        Err(Ok(Error::InvalidStatus))
+    );
+    assert_eq!(s.client.try_cancel(&sub_id), Err(Ok(Error::InvalidStatus)));
+    assert_eq!(s.client.try_charge(&sub_id), Err(Ok(Error::InvalidStatus)));
+}
