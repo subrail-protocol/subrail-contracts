@@ -233,6 +233,70 @@ impl SubRailContract {
         Ok(())
     }
 
+    /// Pause billing. Only an Active subscription can be paused; the
+    /// schedule is shifted by the paused duration on resume.
+    pub fn pause(env: Env, sub_id: u64) -> Result<(), Error> {
+        let mut sub = storage::get_subscription(&env, sub_id)?;
+        sub.subscriber.require_auth();
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::InvalidStatus);
+        }
+        let prev = sub.status;
+        sub.status = SubscriptionStatus::Paused;
+        sub.paused_at = env.ledger().timestamp();
+        storage::set_subscription(&env, &sub);
+        events::status_changed(&env, sub_id, prev, sub.status);
+        Ok(())
+    }
+
+    /// Resume a paused subscription, shifting `next_charge_at` forward by
+    /// exactly the time spent paused, so no period is lost or double-billed.
+    pub fn resume(env: Env, sub_id: u64) -> Result<(), Error> {
+        let mut sub = storage::get_subscription(&env, sub_id)?;
+        sub.subscriber.require_auth();
+        if sub.status != SubscriptionStatus::Paused {
+            return Err(Error::InvalidStatus);
+        }
+        let prev = sub.status;
+        let paused_for = env.ledger().timestamp().saturating_sub(sub.paused_at);
+        sub.next_charge_at += paused_for;
+        sub.paused_at = 0;
+        sub.status = SubscriptionStatus::Active;
+        storage::set_subscription(&env, &sub);
+        events::status_changed(&env, sub_id, prev, sub.status);
+        Ok(())
+    }
+
+    /// Cancel a subscription and refund the entire remaining balance to
+    /// the subscriber. One click, no dark patterns. Terminal.
+    pub fn cancel(env: Env, sub_id: u64) -> Result<(), Error> {
+        let mut sub = storage::get_subscription(&env, sub_id)?;
+        sub.subscriber.require_auth();
+        if matches!(
+            sub.status,
+            SubscriptionStatus::Cancelled | SubscriptionStatus::Expired
+        ) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let prev = sub.status;
+        let refund = sub.balance;
+        sub.balance = 0;
+        sub.status = SubscriptionStatus::Cancelled;
+        storage::set_subscription(&env, &sub);
+
+        if refund > 0 {
+            let plan = storage::get_plan(&env, sub.plan_id)?;
+            token::TokenClient::new(&env, &plan.token).transfer(
+                &env.current_contract_address(),
+                &sub.subscriber,
+                &refund,
+            );
+        }
+        events::status_changed(&env, sub_id, prev, SubscriptionStatus::Cancelled);
+        Ok(())
+    }
+
     // ── Keeper action ───────────────────────────────────────────────────────
 
     /// Attempt to settle the current due period. Permissionless — any
