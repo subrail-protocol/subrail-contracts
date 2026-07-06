@@ -160,3 +160,24 @@ fn subscribe_rejects_deposit_below_first_charge() {
         Err(Ok(Error::DepositBelowFirstCharge))
     );
 }
+
+// ── Deposit / withdraw ─────────────────────────────────────────────────────
+
+#[test]
+fn withdraw_keeps_subscriber_in_control() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    let sub_id = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 3));
+
+    // Pull everything unused back out.
+    s.client.withdraw(&sub_id, &(PRICE * 2));
+    assert_eq!(s.client.get_balance(&sub_id), 0);
+
+    // Over-withdrawal is impossible.
+    assert_eq!(
+        s.client.try_withdraw(&sub_id, &1),
+        Err(Ok(Error::InsufficientBalance))
+    );
+}
