@@ -346,3 +346,22 @@ fn cancel_refunds_full_balance_and_is_terminal() {
     assert_eq!(s.client.try_cancel(&sub_id), Err(Ok(Error::InvalidStatus)));
     assert_eq!(s.client.try_charge(&sub_id), Err(Ok(Error::InvalidStatus)));
 }
+
+// ── Indexes ────────────────────────────────────────────────────────────────
+
+#[test]
+fn subscriber_index_tracks_all_subscriptions() {
+    let s = setup();
+    let plan_id = create_default_plan(&s);
+    let a = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 2));
+    let b = s
+        .client
+        .subscribe(&s.subscriber, &plan_id, &PRICE, &0, &(PRICE * 2));
+
+    let ids = s.client.get_subscriber_subscriptions(&s.subscriber);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get(0), Some(a));
+    assert_eq!(ids.get(1), Some(b));
+}
