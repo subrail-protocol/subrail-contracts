@@ -169,6 +169,58 @@ impl SubRailContract {
         Ok(id)
     }
 
+    /// Add funds to a subscription's prepaid balance.
+    pub fn deposit(env: Env, sub_id: u64, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let mut sub = storage::get_subscription(&env, sub_id)?;
+        sub.subscriber.require_auth();
+        if matches!(
+            sub.status,
+            SubscriptionStatus::Cancelled | SubscriptionStatus::Expired
+        ) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let plan = storage::get_plan(&env, sub.plan_id)?;
+        let contract_addr = env.current_contract_address();
+        token::TokenClient::new(&env, &plan.token).transfer(
+            &sub.subscriber,
+            &contract_addr,
+            &amount,
+        );
+        sub.balance += amount;
+        storage::set_subscription(&env, &sub);
+        events::deposited(&env, sub_id, amount, sub.balance);
+        Ok(())
+    }
+
+    /// Withdraw unused funds from a subscription's balance at any time.
+    /// The subscriber stays in control: withdrawing below one period's
+    /// price simply means the next charge attempt will fail into PastDue.
+    pub fn withdraw(env: Env, sub_id: u64, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let mut sub = storage::get_subscription(&env, sub_id)?;
+        sub.subscriber.require_auth();
+        if amount > sub.balance {
+            return Err(Error::InsufficientBalance);
+        }
+
+        let plan = storage::get_plan(&env, sub.plan_id)?;
+        sub.balance -= amount;
+        storage::set_subscription(&env, &sub);
+        token::TokenClient::new(&env, &plan.token).transfer(
+            &env.current_contract_address(),
+            &sub.subscriber,
+            &amount,
+        );
+        events::withdrawn(&env, sub_id, amount, sub.balance);
+        Ok(())
+    }
+
     // ── Read-only queries ───────────────────────────────────────────────────
 
     pub fn get_plan(env: Env, plan_id: u64) -> Result<Plan, Error> {
