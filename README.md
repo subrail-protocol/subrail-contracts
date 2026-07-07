@@ -5,26 +5,31 @@ Soroban smart contracts for SubRail — an open recurring-payments protocol on S
 ## How it works
 
 SubRail uses a prepaid-balance model. The subscriber funds a per-subscription balance held by the contract and withdrawable at any time. Each elapsed billing period, `charge` moves at most one period's price from that balance to the merchant — never more, never early.
+
+```
 merchant ──[create_plan]──> Plan (immutable price/interval/grace)
 subscriber ──[subscribe: cap + optional lifetime ceiling + deposit]──> Subscription
 keeper ──[charge, permissionless]──> price moves balance → merchant, once per period
 subscriber ──[deposit / withdraw / pause / resume / cancel]──> full control
+```
 
 ### Subscription state machine
 
-                 +---------+
+```
+                     +---------+
+   subscribe ------> | Active  | <---- resume / successful charge
+                     +---------+
+                       |  |  |
+     charge failed --- |  |  --- pause
+                       v  |        v
+                  +---------+   +--------+
+                  | PastDue |   | Paused |
+                  +---------+   +--------+
+                       |
+   grace elapsed ------+------> Expired   (terminal, residual refunded)
 
-subscribe ------> | Active | <---- resume / successful charge
-+---------+
-| | |
-charge failed --- | | --- pause
-v | v
-+---------+ +--------+
-| PastDue | | Paused |
-+---------+ +--------+
-|
-grace elapsed ------+------> Expired (terminal, residual refunded)
-cancel (from Active / PastDue / Paused) ------> Cancelled (terminal, balance refunded)
+   cancel (from Active / PastDue / Paused) ------> Cancelled   (terminal, balance refunded)
+```
 
 A failed charge does not revert — it transitions the subscription to `PastDue` and, once the plan's grace window elapses without recovery, to `Expired`. Every transition emits a typed event carrying `prev_status`/`new_status` so indexers can rebuild the state machine without reading contract storage.
 
